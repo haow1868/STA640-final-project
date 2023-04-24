@@ -1,0 +1,251 @@
+---
+title: "STA640 final project"
+author: "Hao Wang"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r, message=FALSE}
+library(haven)
+library(tidyverse)
+library(dplyr)
+```
+
+```{r}
+stu = read_sav("STAR_Students.sav")
+k3_school = read_sav("STAR_K-3_Schools.sav")
+high_school = read_sav("STAR_High_Schools.sav")
+com_stu = read_sav("Comparison_Students.sav")
+```
+
+```{r}
+# FLAGSGK: in STAR in kindergarten (1:yes, 0:no)
+# gkclasstype: Class type kindergarten (1:small class, 2:regular class, Z)
+# Demographic information: stdntid: Student ID
+# gender: 1 male, 2 female
+# gksurban: school urbanicity kindergarten: 1 Inner city, 2 Suburban, 3 Rural, # 4 Urban
+# gktreadss: total reading scaled score SAT kindergarten
+# gktmathss: total math scaled score SAT kindergarten
+# gktlistss: total listening scale score SAT kindergarten
+
+
+kind = stu %>% 
+  filter(FLAGSGK == 1) %>%
+  filter(gkclasstype %in% c(1,2)) %>%
+  select(stdntid, gender, race, gkfreelunch, gksurban, gkschid,
+         gkclasstype, gktreadss)  %>%
+  filter(race %in% c(1,2)) %>%    # only consider White/Black
+  drop_na(gktreadss) %>%
+  mutate(gktreadss = as.vector(scale(gktreadss)),
+         gkclasstype = if_else(gkclasstype==1,1,0)) # standardize outcome variable
+
+# difference-in-mean unadjusted estimator
+ate_unadj = function(data){
+  sum(data$gktreadss*data$gkclasstype)/sum(data$gkclasstype==1) - 
+    sum(data$gktreadss*(1-data$gkclasstype))/sum(data$gkclasstype==0)
+}
+
+ate_unadj(kind)
+
+```
+
+# covariate adjustment
+
+```{r,message=FALSE,warning=FALSE}
+# check missing values for covariate
+apply(kind, 2, anyNA)
+# impute missing race as 1 white
+kind$race[is.na(kind$race)] = 4
+# impute missing freelunch as 1 free lunch
+kind$gkfreelunch[is.na(kind$gkfreelunch)] = 1
+sum(is.na(kind$gkfreelunch))
+# categorical variable
+cols = c("gender","race","gksurban","gkfreelunch")
+kind[cols] = lapply(kind[cols], as.factor)
+
+# random effect for different school (clusters)
+formula = gktreadss ~ gender + race + gksurban + gkfreelunch + gkclasstype + (1|gkschid)
+
+library(lme4)
+
+ate_adj = function(data){
+  data[cols] = lapply(data[cols], as.factor)
+  
+  # detect one level factor
+  values_count = sapply(lapply(data, unique), length)
+  one_fac_cols = names(values_count[values_count==1])
+  data[one_fac_cols] = lapply(data[one_fac_cols],
+                              function(x) as.numeric(as.character(x)))
+  
+  # fit random effect model
+  ate_adj_model = summary(lmer(formula, data = data))
+  ate_adj_model[["coefficients"]]["gkclasstype","Estimate"]
+}
+
+ate_adj(data = kind)
+
+## generate 1000 bootstrap dataframes
+set.seed(9)
+kind_boot = list()
+for (i in 1:1000) {
+  boot_idx = sample(1:nrow(kind), size = nrow(kind), replace = TRUE)
+  kind_boot[[i]] = kind[boot_idx,]
+}
+
+ate_adj_boot = unlist(lapply(kind_boot,ate_adj))
+sd(ate_adj_boot)
+
+ate_unadj_boot = unlist(lapply(kind_boot, ate_unadj))
+sd(ate_unadj_boot)
+
+```
+
+# endogenous stratification - stratifying on a the predictor of the outcome in the absence of treatment
+
+```{r}
+
+kind_treated = kind[kind$gkclasstype==1,]
+kind_treated[cols] = lapply(kind_treated[cols], as.factor)
+kind_control = kind[kind$gkclasstype==0,]
+kind_control[cols] = lapply(kind_control[cols], as.factor)
+
+# fit the predicted outcome model for the control group
+end_model = lm(formula = gktreadss ~ gender + race + gksurban + gkfreelunch, data = kind_control)
+kind$y_hat = predict(end_model, newdata = kind)
+
+# divide into different groups by predicted outcomes: 3 groups (low:0-1/3, medium:1/3-2/3, high:2/3-1)
+y_hat_low = quantile(kind$y_hat, probs = 1/3)
+y_hat_med = quantile(kind$y_hat, probs = 2/3)
+
+kind_low = kind[kind$y_hat <= y_hat_low,]
+kind_med = kind[kind$y_hat > y_hat_low & kind$y_hat <= y_hat_med, ]
+kind_high = kind[kind$y_hat > y_hat_med,]
+
+
+ate_unadj(data = kind_low)
+ate_unadj(data = kind_med)
+ate_unadj(data = kind_high)
+
+
+```
+
+
+# bias-correction: LOOCV
+$e_{(-i)}=e_{i}/(1-h_i)$
+
+```{r}
+
+# keep in mind: predicted outcome for treated sample use model with all control sample
+leverage = hatvalues(end_model)
+res_loocv = end_model[["residuals"]]/(1-leverage)
+kind_control$y_hat_loocv = kind_control$gktreadss - res_loocv
+kind_treated$y_hat_loocv = predict(end_model, newdata=kind_treated)
+
+kind_loocv = rbind(kind_control, kind_treated)
+
+# divide into different groups by predicted outcomes: 3 groups (low:0-1/3, medium:1/3-2/3, high:2/3-1)
+y_hat_loocv_low = quantile(kind_loocv$y_hat_loocv, probs = 1/3)
+y_hat_loocv_med = quantile(kind_loocv$y_hat_loocv, probs = 2/3)
+
+kind_loocv_low = kind_loocv[kind_loocv$y_hat_loocv <= y_hat_loocv_low,]
+kind_loocv_med = kind_loocv[kind_loocv$y_hat_loocv > y_hat_loocv_low & 
+                              kind_loocv$y_hat_loocv <= y_hat_loocv_med, ]
+kind_loocv_high = kind_loocv[kind_loocv$y_hat_loocv > y_hat_loocv_med,]
+
+ate_unadj(data = kind_loocv_low)
+ate_unadj(data = kind_loocv_med)
+ate_unadj(data = kind_loocv_high)
+
+
+```
+
+
+```{r}
+
+ate_end = function(data){
+  data[cols] = lapply(data[cols], as.factor)
+  data_treated = data[data$gkclasstype==1,]
+  data_control = data[data$gkclasstype==0,]
+  
+  # fit the predicted outcome model for the control group
+  end_model = lm(formula = gktreadss ~ gender + race + gksurban + gkfreelunch, data = data_control)
+  data$y_hat = predict(end_model, newdata = data)
+  
+  # divide into different groups by predicted outcomes: 3 groups (low:0-1/3, medium:1/3-2/3, high:2/3-1)
+  y_hat_low = quantile(data$y_hat, probs = 1/3)
+  y_hat_med = quantile(data$y_hat, probs = 2/3)
+  
+  data_low = data[data$y_hat <= y_hat_low,]
+  data_med = data[data$y_hat > y_hat_low & data$y_hat <= y_hat_med, ]
+  data_high = data[data$y_hat > y_hat_med,]
+  
+  # keep in mind: predicted outcome for treated sample use model with all control sample
+  leverage = hatvalues(end_model)
+  res_loocv = end_model[["residuals"]]/(1-leverage)
+  data_control$y_hat_loocv = data_control$gktreadss - res_loocv
+  data_treated$y_hat_loocv = predict(end_model, newdata=data_treated)
+  
+  data_loocv = rbind(data_control, data_treated)
+  
+  # divide into different groups by predicted outcomes: 3 groups (low:0-1/3, medium:1/3-2/3, high:2/3-1)
+  y_hat_loocv_low = quantile(data_loocv$y_hat_loocv, probs = 1/3)
+  y_hat_loocv_med = quantile(data_loocv$y_hat_loocv, probs = 2/3)
+  
+  data_loocv_low = data_loocv[data_loocv$y_hat_loocv <= y_hat_loocv_low,]
+  data_loocv_med = data_loocv[data_loocv$y_hat_loocv > y_hat_loocv_low & 
+                                data_loocv$y_hat_loocv <= y_hat_loocv_med, ]
+  data_loocv_high = data_loocv[data_loocv$y_hat_loocv > y_hat_loocv_med,]
+  
+  return(list(ate_low = ate_unadj(data_low),
+              ate_med = ate_unadj(data_med),
+              ate_high = ate_unadj(data_high),
+              ate_loocv_low = ate_unadj(data_loocv_low),
+              ate_loocv_med = ate_unadj(data_loocv_med),
+              ate_loocv_high = ate_unadj(data_loocv_high),
+              ate_adj_low = ate_adj(data_low),
+              ate_adj_med = ate_adj(data_med),
+              ate_adj_high = ate_adj(data_high),
+              ate_adj_loocv_low = ate_adj(data_loocv_low),
+              ate_adj_loocv_med = ate_adj(data_loocv_med),
+              ate_adj_loocv_high = ate_adj(data_loocv_high)
+              )
+         )
+}
+
+
+ate_end_list=ate_end(data = kind)
+
+ate_end_boot_lise = 
+
+```
+
+# 10-fold CV
+
+```{r}
+
+
+
+```
+
+
+
+# shrinkage for beta: try ridge and lasso
+
+```{r}
+
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
